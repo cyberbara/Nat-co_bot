@@ -1,243 +1,270 @@
 import asyncio
 import logging
 import pandas as pd
-from datetime import datetime
 import os
-
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- 1. КОНСТАНТЫ ---
-TOKEN = "8504650336:AAH-ZqQeR4W66t7pL7jhT04nRwpryI-gEV4"
-ADMIN_IDS = [1661192784]
-DB_FILE = "participants.csv"
-BAR_FEE = 500
-REQUISITES = "КАРТА СБЕРБАНКА: 2202 2069 1078 1926\nБАНК: ТИНЬКОФФ, ПО НОМЕРУ ТЕЛЕФОНА: +7 937 619 82-22"
+import config
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
 
-class Registration(StatesGroup):
-    waiting_for_fio = State()
-    waiting_for_age = State()
-    waiting_for_allergies = State()
-    waiting_for_preference = State()
-    waiting_for_bar_type = State()
-    waiting_for_payment_confirmation = State()
+class ConfReg(StatesGroup):
+    fio = State()
+    dob = State()
+    phone = State()
+    needs_release = State()
+    uni_name = State()
+    english = State()
+    has_allergies = State()
+    allergies_detail = State()
+    is_vegan = State()
+    diet_detail = State()
+    expectations = State()
+    wants_merch = State()
+    merch_detail = State()
+    plan_pay_date = State()
+    waiting_for_payment = State()
 
 
-# --- 2. РАБОТА С БД (Без ЛК) ---
-def load_db():
-    if os.path.exists(DB_FILE):
-        return pd.read_csv(DB_FILE)
-    return pd.DataFrame(columns=[
-        'telegram_id', 'username', 'fio', 'age', 'allergies',
-        'preference', 'bar_type', 'status', 'reg_date'
-    ])
+# --- Инструменты ---
 
-
-def save_participant(data, tg_id, username):
-    df = load_db()
-    new_entry = {
-        'telegram_id': tg_id,
-        'username': f"@{username}" if username else "N/A",
-        'fio': data.get('fio'),
-        'age': data.get('age'),
-        'allergies': data.get('allergies'),
-        'preference': data.get('preference'),
-        'bar_type': data.get('bar_type'),
-        'status': 'Registered',
-        'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
-    df = df[df['telegram_id'] != tg_id]
-    df = pd.concat([df, pd.DataFrame([new_entry])], ignore_index=True)
-    df.to_csv(DB_FILE, index=False)
-
-
-def update_status(tg_id, new_status):
-    df = load_db()
-    if tg_id in df['telegram_id'].values:
-        df.loc[df['telegram_id'] == tg_id, 'status'] = new_status
-        df.to_csv(DB_FILE, index=False)
-        return True
-    return False
-
-
-# --- 3. КЛАВИАТУРЫ ---
-def get_bar_type_kb():
+def get_yes_no_kb():
     builder = ReplyKeyboardBuilder()
-    builder.button(text="Алко-бар 🍷")
-    builder.button(text="Б/А-бар 🥤")
+    builder.button(text="Да");
+    builder.button(text="Нет")
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-# --- 4. ХЕНДЛЕРЫ РЕГИСТРАЦИИ (Твой текст) ---
+def save_to_db(data, tg_id, username):
+    df = pd.read_csv(config.DB_FILE) if os.path.exists(config.DB_FILE) else pd.DataFrame()
+    new_row = {
+        'tg_id': tg_id,
+        'username': f"@{username}" if username else "N/A",
+        'status': 'Awaiting Payment',
+        'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
+        **data
+    }
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    df.to_csv(config.DB_FILE, index=False)
+
+
+# --- Хендлеры регистрации ---
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer(f"""Привет, дорогой делегат! Если ты планируешь пользоваться безлимитным баром на вечеринке 12 января (как алкогольным, так и безалкогольным), то необходимо оставить заявку в этом боте!
-
-Взнос за безлимитный бар составляет {BAR_FEE} руб.
-
-В баре будет полноценное меню различных коктейлей, каждый найдет что-то на свой вкус!
-
-А теперь приступим к реггистрации, напиши свое ФИО:""")
-    await state.set_state(Registration.waiting_for_fio)
+    await message.answer(f"{config.WELCOME_MSG}\n\n**Введи свое ФИО:**", parse_mode="Markdown")
+    await state.set_state(ConfReg.fio)
 
 
-@router.message(Registration.waiting_for_fio)
-async def process_fio(message: types.Message, state: FSMContext):
+@router.message(ConfReg.fio)
+async def proc_fio(message: types.Message, state: FSMContext):
     await state.update_data(fio=message.text)
-    await message.answer("Сколько вам лет?")
-    await state.set_state(Registration.waiting_for_age)
+    await message.answer("Дата рождения (ДД.ММ.ГГГГ):")
+    await state.set_state(ConfReg.dob)
 
 
-@router.message(Registration.waiting_for_age)
-async def process_age(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("Пожалуйста, введите возраст числом:")
-    await state.update_data(age=message.text)
-    await message.answer("Есть ли у вас аллергии? (Если нет — напишите 'нет')")
-    await state.set_state(Registration.waiting_for_allergies)
+@router.message(ConfReg.dob)
+async def proc_dob(message: types.Message, state: FSMContext):
+    await state.update_data(dob=message.text)
+    await message.answer("Твой номер телефона:")
+    await state.set_state(ConfReg.phone)
 
 
-@router.message(Registration.waiting_for_allergies)
-async def process_allergies(message: types.Message, state: FSMContext):
+@router.message(ConfReg.phone)
+async def proc_phone(message: types.Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await message.answer("Нужна ли тебе справка для университета?", reply_markup=get_yes_no_kb())
+    await state.set_state(ConfReg.needs_release)
+
+
+# Логика ветвления (Справка)
+@router.message(ConfReg.needs_release)
+async def proc_release(message: types.Message, state: FSMContext):
+    if message.text.lower() == "да":
+        await message.answer("Название твоего учебного заведения:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.uni_name)
+    else:
+        await state.update_data(uni_name="Не требуется")
+        await message.answer("Твой уровень английского:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.english)
+
+
+@router.message(ConfReg.uni_name)
+async def proc_uni(message: types.Message, state: FSMContext):
+    await state.update_data(uni_name=message.text)
+    await message.answer("Твой уровень английского:")
+    await state.set_state(ConfReg.english)
+
+
+@router.message(ConfReg.english)
+async def proc_eng(message: types.Message, state: FSMContext):
+    await state.update_data(english=message.text)
+    await message.answer("Есть ли у тебя аллергии?", reply_markup=get_yes_no_kb())
+    await state.set_state(ConfReg.has_allergies)
+
+
+# Логика ветвления (Аллергии)
+@router.message(ConfReg.has_allergies)
+async def proc_has_alg(message: types.Message, state: FSMContext):
+    if message.text.lower() == "да":
+        await message.answer("Опиши аллергии:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.allergies_detail)
+    else:
+        await state.update_data(allergies="Нет")
+        await message.answer("Ты вегетарианец или веган?", reply_markup=get_yes_no_kb())
+        await state.set_state(ConfReg.is_vegan)
+
+
+@router.message(ConfReg.allergies_detail)
+async def proc_alg_det(message: types.Message, state: FSMContext):
     await state.update_data(allergies=message.text)
-    await message.answer("Какие напитки предпочитаете?")
-    await state.set_state(Registration.waiting_for_preference)
+    await message.answer("Ты вегетарианец или веган?", reply_markup=get_yes_no_kb())
+    await state.set_state(ConfReg.is_vegan)
 
 
-@router.message(Registration.waiting_for_preference)
-async def process_pref(message: types.Message, state: FSMContext):
-    await state.update_data(preference=message.text)
-    await message.answer("Какой тип бара выбираете?", reply_markup=get_bar_type_kb())
-    await state.set_state(Registration.waiting_for_bar_type)
+# Логика ветвления (Диета)
+@router.message(ConfReg.is_vegan)
+async def proc_vegan(message: types.Message, state: FSMContext):
+    if message.text.lower() == "да":
+        await message.answer("Примеры блюд, которые ты ешь:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.diet_detail)
+    else:
+        await state.update_data(diet="Обычное")
+        await message.answer("Ожидания от конференции?", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.expectations)
 
 
-@router.message(Registration.waiting_for_bar_type)
-async def process_bar_selection(message: types.Message, state: FSMContext):
-    await state.update_data(bar_type=message.text)
+@router.message(ConfReg.diet_detail)
+async def proc_diet_det(message: types.Message, state: FSMContext):
+    await state.update_data(diet=message.text)
+    await message.answer("Ожидания от конференции?")
+    await state.set_state(ConfReg.expectations)
+
+
+@router.message(ConfReg.expectations)
+async def proc_exp(message: types.Message, state: FSMContext):
+    await state.update_data(expectations=message.text)
+    await message.answer("Интересует ли тебя мерч (CC Shop)?", reply_markup=get_yes_no_kb())
+    await state.set_state(ConfReg.wants_merch)
+
+
+# Логика ветвления (Мерч)
+@router.message(ConfReg.wants_merch)
+async def proc_merch(message: types.Message, state: FSMContext):
+    if message.text.lower() == "да":
+        await message.answer("Что бы ты хотел видеть в CC Shop?", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(ConfReg.merch_detail)
+    else:
+        await state.update_data(merch="Нет")
+        await ask_payment_date(message, state)
+
+
+@router.message(ConfReg.merch_detail)
+async def proc_merch_det(message: types.Message, state: FSMContext):
+    await state.update_data(merch=message.text)
+    await ask_payment_date(message, state)
+
+
+# Валидация даты оплаты
+async def ask_payment_date(message: types.Message, state: FSMContext):
+    ddl = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").strftime("%d.%m.%Y")
+    await message.answer(f"Когда ты планируешь оплатить участие?\n(Не позже дедлайна: {ddl})",
+                         reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(ConfReg.plan_pay_date)
+
+
+@router.message(ConfReg.plan_pay_date)
+async def proc_pay_date(message: types.Message, bot: Bot, state: FSMContext):
+    try:
+        plan_dt = datetime.strptime(message.text, "%d.%m.%Y")
+        ddl_dt = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d")
+        if plan_dt > ddl_dt:
+            return await message.answer(
+                f"❌ Нельзя выбрать дату позже дедлайна ({ddl_dt.strftime('%d.%m.%Y')}). Попробуй еще раз:")
+
+        await state.update_data(plan_pay_date=message.text)
+        await finish_registration(message, bot, state)
+    except:
+        await message.answer("❌ Используй формат ДД.ММ.ГГГГ")
+
+
+async def finish_registration(message: types.Message, bot: Bot, state: FSMContext):
     data = await state.get_data()
+    save_to_db(data, message.from_user.id, message.from_user.username)
 
-    # Сохраняем в БД сразу после выбора бара
-    save_participant(data, message.from_user.id, message.from_user.username)
+    # Оповещение админам
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id,
+                                   f"⚡️ **НОВАЯ ЗАЯВКА**\n👤 {data['fio']}\n📅 План оплаты: {data['plan_pay_date']}\n🆔 `{message.from_user.id}`",
+                                   parse_mode="Markdown")
+        except:
+            pass
 
     kb = ReplyKeyboardBuilder()
     kb.button(text="✅ Я оплатил(а)")
-
     await message.answer(
-        f"""Оплата взноса — {BAR_FEE}р
-
-Пожалуйста, осуществи перевод на следующие реквизиты:.\n\n{REQUISITES}
-
-ОБЯЗАТЕЛЬНО укажи в комментарии перевода:
-ФИО (как в регистрации) + БАР
-
-После перевода нажми кнопку ниже, чтобы сообщить нам об оплате""",
+        f"Данные сохранены! Взнос: {config.REG_FEE}₽\n\n{config.REQUISITES}\n\n"
+        f"Если возникнут вопросы, пиши в поддержку: {config.SUPPORT_CONTACT}",
         reply_markup=kb.as_markup(resize_keyboard=True)
     )
-    await state.set_state(Registration.waiting_for_payment_confirmation)
+    await state.set_state(ConfReg.waiting_for_payment)
 
 
-@router.message(Registration.waiting_for_payment_confirmation, F.text == "✅ Я оплатил(а)")
-async def payment_sent(message: types.Message):
-    await message.answer("Спасибо! Теперь перешлите чек об оплате в чат (фото или файл)",
-                         reply_markup=types.ReplyKeyboardRemove())
-
-
-# Пересылка чека админу
-@router.message(Registration.waiting_for_payment_confirmation, F.photo | F.document)
-async def forward_receipt(message: types.Message, bot: Bot, state: FSMContext):
-    update_status(message.from_user.id, "Pending Confirmation")
-
-    user_info = (
-        f"📩 **Новый чек от пользователя!**\n"
-        f"ФИО: {message.from_user.full_name}\n"
-        f"ID: `{message.from_user.id}`\n"
-        f"Юзернейм: @{message.from_user.username or 'скрыт'}\n"
-        f"Подтвердить: `/confirm {message.from_user.id}`"
-    )
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, user_info, parse_mode="Markdown")
-            await message.send_copy(chat_id=admin_id)
-        except Exception:
-            logging.error(f"Не удалось переслать файл админу")
-
-    await message.reply("✅ Файл получен и передан администраторам для проверки.")
+# Обработка чека
+@router.message(ConfReg.waiting_for_payment, F.photo | F.document)
+async def handle_receipt(message: types.Message, bot: Bot, state: FSMContext):
+    for admin_id in config.ADMIN_IDS:
+        await bot.send_message(admin_id,
+                               f"🧾 **ЧЕК НА ПРОВЕРКУ** от {message.from_user.id}\n/confirm {message.from_user.id}")
+        await message.send_copy(chat_id=admin_id)
+    await message.answer("Принято! Мы проверим оплату и подтвердим участие.", reply_markup=types.ReplyKeyboardRemove())
     await state.clear()
 
 
-# --- 5. АДМИН-ПАНЕЛЬ ---
+# --- Планировщик напоминаний ---
 
-@router.message(Command("admin"))
-async def admin_menu(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Список всех", callback_data="view_all")
-    kb.button(text="📢 Напомнить должникам", callback_data="remind_unpaid")
-    kb.button(text="📂 Выгрузить CSV", callback_data="export_csv")
-    kb.adjust(1)
-    await message.answer("Админ-панель:", reply_markup=kb.as_markup())
+async def send_reminders(bot: Bot):
+    if not os.path.exists(config.DB_FILE): return
+    df = pd.read_csv(config.DB_FILE)
+    today = datetime.now().date()
+    ddl = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").date()
+    days_left = (ddl - today).days
 
+    msg = ""
+    if days_left == 7:
+        msg = config.REMINDER_7D
+    elif days_left == 3:
+        msg = config.REMINDER_3D
+    elif days_left == 0:
+        msg = config.REMINDER_0D
 
-@router.callback_query(F.data == "view_all")
-async def view_all(callback: types.CallbackQuery):
-    df = load_db()
-    if df.empty: return await callback.answer("База пуста")
-    text = "📝 **Участники:**\n\n"
-    for _, row in df.iterrows():
-        status = "✅" if row['status'] == 'Confirmed' else "⏳"
-        text += f"{status} {row['fio']} ({row['bar_type']})\n"
-    await callback.message.answer(text[:4000], parse_mode="Markdown")
-    await callback.answer()
-
-
-@router.message(Command("confirm"))
-async def confirm_pay(message: types.Message, bot: Bot):
-    if message.from_user.id not in ADMIN_IDS: return
-    try:
-        uid = int(message.text.split()[1])
-        if update_status(uid, "Confirmed"):
-            await bot.send_message(uid, "✨ Ваша оплата подтверждена! До встречи в баре!")
-            await message.answer(f"✅ Успешно для {uid}")
-    except:
-        await message.answer("Ошибка. Формат: `/confirm ID`", parse_mode="Markdown")
-
-
-@router.callback_query(F.data == "export_csv")
-async def export_csv(callback: types.CallbackQuery):
-    if os.path.exists(DB_FILE):
-        await callback.message.answer_document(types.FSInputFile(DB_FILE))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "remind_unpaid")
-async def remind_unpaid(callback: types.CallbackQuery, bot: Bot):
-    df = load_db()
-    unpaid = df[df['status'] == 'Registered']
-    count = 0
-    for tid in unpaid['telegram_id']:
-        try:
-            await bot.send_message(tid,
-                                   "⚠️ Напоминаем, что вы не завершили регистрацию в бар. Пожалуйста, оплатите взнос и пришлите чек!")
-            count += 1
-        except:
-            pass
-    await callback.answer(f"Отправлено: {count}", show_alert=True)
+    if msg:
+        unpaid = df[df['status'] == 'Awaiting Payment']
+        for tid in unpaid['tg_id']:
+            try:
+                await bot.send_message(tid, msg)
+            except:
+                pass
 
 
 async def main():
-    bot = Bot(token=TOKEN)
+    bot = Bot(token=config.TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(send_reminders, 'cron', hour=10, minute=0, args=[bot])
+    scheduler.start()
+
     await dp.start_polling(bot)
 
 
