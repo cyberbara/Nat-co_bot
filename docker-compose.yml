@@ -1,11 +1,12 @@
 version: '3.8'
-
 services:
   bot:
     build: .
-    container_name: bar_bot
+    container_name: natco_bot
     restart: always
     volumes:
       - .:/app
+      - ./registration_photos:/app/registration_photos
+      - ./participants.csv:/app/participants.csv
     environment:
       - PYTHONUNBUFFERED=1
