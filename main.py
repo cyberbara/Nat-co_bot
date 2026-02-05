@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.TOKEN)
 dp = Dispatcher()
@@ -33,12 +34,12 @@ class RegStates(StatesGroup):
     expectations = State()
     wants_merch = State()
     merch_info = State()
-    waiting_photo = State()  # Фото как этап регистрации
+    waiting_photo = State()
     plan_date = State()
     waiting_payment = State()
 
 
-# --- Вспомогательные функции ---
+# --- Helpers ---
 def get_yes_no_kb():
     return ReplyKeyboardBuilder().button(text="Да").button(text="Нет").as_markup(resize_keyboard=True,
                                                                                  one_time_keyboard=True)
@@ -46,17 +47,21 @@ def get_yes_no_kb():
 
 def save_user_to_db(data, tg_id, username):
     df = pd.read_csv(config.DB_FILE) if os.path.exists(config.DB_FILE) else pd.DataFrame()
-    data['tg_id'] = tg_id
-    data['username'] = f"@{username}" if username else "N/A"
-    data['status'] = 'Awaiting Payment'
-    data['reg_date'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
+    new_data = {
+        'tg_id': tg_id,
+        'username': f"@{username}" if username else "N/A",
+        'status': 'Awaiting Payment',
+        'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
+        **data
+    }
+    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
     df.to_csv(config.DB_FILE, index=False)
 
 
-# --- Хендлеры опроса ---
+# --- Handlers ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(config.WELCOME_MSG)
     await message.answer("Введите ваше ФИО (как в паспорте):")
     await state.set_state(RegStates.fio)
@@ -167,15 +172,14 @@ async def p_merch_info(m: types.Message, state: FSMContext):
     await ask_photo(m, state)
 
 
-# --- ЭТАП ФОТО ---
+# --- Фото ---
 async def ask_photo(m, state):
-    await m.answer("📸 Пришли своё фото для пропуска/активности (как изображение).",
-                   reply_markup=types.ReplyKeyboardRemove())
+    await m.answer("📸 Пришли своё фото для пропуска (как изображение).", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(RegStates.waiting_photo)
 
 
 @router.message(RegStates.waiting_photo, F.photo)
-async def p_photo(m: types.Message, state: FSMContext, bot: Bot):
+async def p_photo(m: types.Message, state: FSMContext):
     data = await state.get_data()
     fio = data.get("fio", f"id_{m.from_user.id}")
     safe_fio = re.sub(r'[^\w\s-]', '', fio).strip().replace(' ', '_')
@@ -186,49 +190,55 @@ async def p_photo(m: types.Message, state: FSMContext, bot: Bot):
 
     await state.update_data(photo_saved=file_path)
 
-    ddl = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").strftime("%d.%m.%Y")
-    await m.answer(f"✅ Фото получено.\n\nКогда планируешь оплатить? (Крайний срок: {ddl})\nФормат: ДД.ММ.ГГГГ")
+    ddl_str = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").strftime("%d.%m.%Y")
+    await m.answer(
+        f"✅ Фото сохранено.\n\nКогда планируешь оплатить? (Дедлайн: {ddl_str})\nНапиши в формате: ДД.ММ.ГГГГ")
     await state.set_state(RegStates.plan_date)
 
 
-# --- ФИНАЛ ---
+# --- Валидация Даты (Исправлено) ---
 @router.message(RegStates.plan_date)
 async def p_date(m: types.Message, state: FSMContext):
+    input_text = m.text.strip()
+
+    # 1. Проверка формата
     try:
-        plan_dt = datetime.strptime(m.text, "%d.%m.%Y")
-        ddl_dt = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d")
-        if plan_dt > ddl_dt:
-            return await m.answer(f"❌ Позже дедлайна нельзя! Введите дату до {ddl_dt.strftime('%d.%m.%Y')}:")
+        plan_dt = datetime.strptime(input_text, "%d.%m.%Y")
+    except ValueError:
+        return await m.answer("❌ Неверный формат! Напиши дату как: 20.12.2025")
 
-        await state.update_data(plan_pay_date=m.text)
-        data = await state.get_data()
-        save_user_to_db(data, m.from_user.id, m.from_user.username)
+    # 2. Проверка на дедлайн
+    ddl_dt = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d")
+    if plan_dt > ddl_dt:
+        return await m.answer(f"❌ Позже дедлайна нельзя! Введи дату до {ddl_dt.strftime('%d.%m.%Y')}:")
 
-        # Оповещение админам (без оплаты)
-        for aid in config.ADMIN_IDS:
-            await bot.send_message(aid,
-                                   f"⚡️ **НОВАЯ ЗАЯВКА**\n👤 {data['fio']}\n📅 План оплаты: {m.text}\n🆔 `{m.from_user.id}`")
+    # 3. Сохранение, если всё ОК
+    await state.update_data(plan_pay_date=input_text)
+    data = await state.get_data()
+    save_user_to_db(data, m.from_user.id, m.from_user.username)
 
-        kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
-        await m.answer(
-            f"Данные сохранены! Взнос: {config.REG_FEE}₽\n\n{config.REQUISITES}\n\nКак оплатишь — жми кнопку и кидай чек!",
-            reply_markup=kb)
-        await state.set_state(RegStates.waiting_payment)
-    except:
-        await m.answer("❌ Напиши дату как 20.12.2025")
+    # Уведомление админам
+    for aid in config.ADMIN_IDS:
+        await bot.send_message(aid,
+                               f"⚡️ **НОВАЯ ЗАЯВКА**\n👤 {data['fio']}\n📅 План оплаты: {input_text}\n🆔 `{m.from_user.id}`")
+
+    kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
+    await m.answer(
+        f"Данные сохранены! Взнос: {config.REG_FEE}₽\n\n{config.REQUISITES}\n\nКак оплатишь — жми кнопку и кидай чек сюда!",
+        reply_markup=kb)
+    await state.set_state(RegStates.waiting_payment)
 
 
 @router.message(RegStates.waiting_payment, F.photo | F.document)
 async def p_receipt(m: types.Message, state: FSMContext):
     for aid in config.ADMIN_IDS:
-        await bot.send_message(aid, f"🧾 **ЧЕК** от {m.from_user.id}\nДля подтверждения: `/confirm {m.from_user.id}`")
+        await bot.send_message(aid, f"🧾 **ЧЕК** от {m.from_user.id}\n/confirm {m.from_user.id}")
         await m.send_copy(chat_id=aid)
-    await m.answer(f"Принято! Проверим и подтвердим. Поддержка: {config.SUPPORT_LINK}",
-                   reply_markup=types.ReplyKeyboardRemove())
+    await m.answer(f"Принято! Поддержка: {config.SUPPORT_LINK}", reply_markup=types.ReplyKeyboardRemove())
     await state.clear()
 
 
-# --- Админка ---
+# --- Остальное (Админка и Планировщик) ---
 @router.message(Command("confirm"))
 async def adm_confirm(m: types.Message):
     if m.from_user.id not in config.ADMIN_IDS: return
@@ -240,10 +250,9 @@ async def adm_confirm(m: types.Message):
         await bot.send_message(uid, f"✨ Ваше участие в {config.CONF_NAME} подтверждено!")
         await m.answer("Готово!")
     except:
-        await m.answer("Формат: /confirm ID")
+        await m.answer("ID?")
 
 
-# --- Напоминания ---
 async def send_reminders():
     if not os.path.exists(config.DB_FILE): return
     df = pd.read_csv(config.DB_FILE)
