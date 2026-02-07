@@ -31,11 +31,17 @@ class RegStates(StatesGroup):
     allergies_info = State()
     is_vegan = State()
     vegan_info = State()
+
+    # --- НОВЫЕ СОСТОЯНИЯ ---
+    consent_data = State()  # Согласие на обработку данных
+    consent_photo = State()  # Согласие на съемку
+    # -----------------------
+
     expectations = State()
     waiting_photo = State()
     plan_date = State()
     waiting_payment = State()
-    waiting_post = State()  # Для рассылки
+    waiting_post = State()
 
 
 # --- Вспомогательные функции ---
@@ -47,12 +53,15 @@ def get_db():
 
 def save_user(data, tg_id, username):
     df = get_db()
+    # Удаляем лишние технические поля, если они есть
+    clean_data = {k: v for k, v in data.items() if k not in ['photo_saved']}
+
     new_row = {
         'tg_id': tg_id,
         'username': f"@{username}" if username else "N/A",
         'status': 'Awaiting Payment',
         'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
-        **data
+        **clean_data
     }
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df.to_csv(config.DB_FILE, index=False)
@@ -144,15 +153,56 @@ async def p_vegan(m: types.Message, state: FSMContext):
         await state.set_state(RegStates.vegan_info)
     else:
         await state.update_data(diet="Обычное")
-        await m.answer("Твои ожидания от конференции?", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(RegStates.expectations)
+        # ПЕРЕХОД К СОГЛАСИЯМ ВМЕСТО ОЖИДАНИЙ
+        await ask_consent_data(m, state)
 
 
 @router.message(RegStates.vegan_info)
 async def p_vegan_info(m: types.Message, state: FSMContext):
     await state.update_data(diet=m.text)
-    await m.answer("Твои ожидания от конференции?")
+    # ПЕРЕХОД К СОГЛАСИЯМ ВМЕСТО ОЖИДАНИЙ
+    await ask_consent_data(m, state)
+
+
+# --- НОВЫЙ БЛОК: СОГЛАСИЯ ---
+
+async def ask_consent_data(m: types.Message, state: FSMContext):
+    msg = (
+        "📜 **Обработка данных**\n"
+        "Даешь ли ты согласие на обработку персональных данных для организации конференции?"
+    )
+    await m.answer(msg, reply_markup=get_yes_no_kb(), parse_mode="Markdown")
+    await state.set_state(RegStates.consent_data)
+
+
+@router.message(RegStates.consent_data)
+async def p_consent_data(m: types.Message, state: FSMContext):
+    if m.text.lower() != "да":
+        await m.answer("❌ К сожалению, без согласия на обработку данных мы не можем зарегистрировать тебя.",
+                       reply_markup=types.ReplyKeyboardRemove())
+        return await state.clear()
+
+    await state.update_data(consent_personal_data="Да")
+
+    msg = (
+        "📸 **Фото и видео**\n"
+        "Согласен(на) ли ты на фото- и видеосъемку во время мероприятия и публикацию материалов в соцсетях?"
+    )
+    await m.answer(msg, reply_markup=get_yes_no_kb(), parse_mode="Markdown")
+    await state.set_state(RegStates.consent_photo)
+
+
+@router.message(RegStates.consent_photo)
+async def p_consent_photo(m: types.Message, state: FSMContext):
+    consent = "Да" if m.text.lower() == "да" else "Нет"
+    await state.update_data(consent_media=consent)
+
+    # Возвращаемся к стандартному флоу
+    await m.answer("Твои ожидания от конференции?", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(RegStates.expectations)
+
+
+# ----------------------------
 
 
 @router.message(RegStates.expectations)
@@ -186,13 +236,31 @@ async def p_date(m: types.Message, state: FSMContext):
 
         await state.update_data(plan_pay_date=m.text)
         data = await state.get_data()
+
+        # Сохраняем в БД
         save_user(data, m.from_user.id, m.from_user.username)
+
+        # --- НОВОЕ: УВЕДОМЛЕНИЕ АДМИНУ О РЕГИСТРАЦИИ ---
+        admin_msg = (
+            f"🆕 **НОВАЯ АНКЕТА**\n"
+            f"👤 {data['fio']}\n"
+            f"📱 {data['phone']}\n"
+            f"📅 Оплатит: {m.text}\n"
+            f"📷 Согласие на съемку: {data.get('consent_media', 'Нет')}"
+        )
+        for aid in config.ADMIN_IDS:
+            try:
+                await bot.send_message(aid, admin_msg, parse_mode="Markdown")
+            except:
+                pass
+        # ---------------------------------------------
 
         kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
         await m.answer(f"Записал! Взнос: {config.REG_FEE}₽\n\n{config.REQUISITES}\n\nКидай чек сюда!", reply_markup=kb,
                        parse_mode="Markdown")
         await state.set_state(RegStates.waiting_payment)
-    except:
+    except Exception as e:
+        logging.error(e)
         await m.answer("❌ Ошибка формата. Напиши дату как: 20.12.2025")
 
 
@@ -237,7 +305,7 @@ async def adm_panel(m: types.Message):
     )
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Статистика", callback_data="adm_stats")
-    kb.button(text="📥 База (CSV)", callback_data="adm_export")  # ВОТ ОНА!
+    kb.button(text="📥 База (CSV)", callback_data="adm_export")
     kb.button(text="📸 Выгрузить все ФОТО", callback_data="adm_photos")
     await m.answer(msg, reply_markup=kb.adjust(1).as_markup(), parse_mode="Markdown")
 
@@ -251,7 +319,7 @@ async def call_stats(c: types.CallbackQuery):
     await c.answer()
 
 
-@router.callback_query(F.data == "adm_export")  # ИСПРАВЛЕНО: Вернул обработчик
+@router.callback_query(F.data == "adm_export")
 async def call_export(c: types.CallbackQuery):
     if os.path.exists(config.DB_FILE):
         file = types.FSInputFile(config.DB_FILE)
