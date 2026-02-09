@@ -2,353 +2,369 @@ import asyncio
 import logging
 import pandas as pd
 import os
-import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+# Для Google Sheets и Напоминаний
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.TOKEN)
 dp = Dispatcher()
 router = Router()
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 
-# --- Состояния ---
 class RegStates(StatesGroup):
     fio = State()
     dob = State()
     phone = State()
+    lc_ig = State()
+    position = State()
     needs_release = State()
     uni_name = State()
     english = State()
-    has_allergies = State()
-    allergies_info = State()
+    allergies = State()
     is_vegan = State()
-    vegan_info = State()
-    expectations = State()
-    waiting_photo = State()
+    diet_info = State()
+    arrival_moscow = State()
+    stay_place = State()
+    expectations_cc = State()
+    expectations_content = State()
+    is_volunteer = State()
+    agreements = State()
     plan_date = State()
     waiting_payment = State()
-    waiting_post = State()  # Для рассылки
+    waiting_post = State()
 
 
 # --- Вспомогательные функции ---
 def get_db():
-    if os.path.exists(config.DB_FILE) and os.path.getsize(config.DB_FILE) > 0:
-        return pd.read_csv(config.DB_FILE)
+    if os.path.exists(config.DB_FILE):
+        try:
+            return pd.read_csv(config.DB_FILE)
+        except:
+            return pd.DataFrame()
     return pd.DataFrame()
 
 
-def save_user(data, tg_id, username):
+async def save_to_gsheets(data):
+    if not config.USE_GOOGLE_SHEETS: return
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(config.GS_KEY_FILE, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(config.GS_SHEET_URL).sheet1
+        row = [datetime.now().strftime("%Y-%m-%d %H:%M")] + list(data.values())
+        sheet.append_row(row)
+    except Exception as e:
+        logging.error(f"GSheets Error: {e}")
+
+
+def get_inline_kb(options, prefix="sel_"):
+    builder = InlineKeyboardBuilder()
+    for opt in options: builder.button(text=opt, callback_data=f"{prefix}{opt}"[:64])
+    return builder.adjust(1).as_markup()
+
+
+# --- ЛОГИКА НАПОМИНАНИЙ ---
+async def send_payment_reminders():
+    logging.info("Checking for payment reminders...")
     df = get_db()
-    new_row = {
-        'tg_id': tg_id,
-        'username': f"@{username}" if username else "N/A",
-        'status': 'Awaiting Payment',
-        'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
-        **data
-    }
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    df.to_csv(config.DB_FILE, index=False)
+    if df.empty or 'status' not in df.columns: return
+
+    ddl_date = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").date()
+    today = datetime.now().date()
+    days_left = (ddl_date - today).days
+
+    # Напоминаем за 7, 3 и 1 день
+    if days_left in [7, 3, 1]:
+        # Фильтруем тех, кто еще не оплатил (статус Pending)
+        pending_users = df[df['status'] == 'Pending']
+
+        for _, user in pending_users.iterrows():
+            user_id = user['id']
+            user_lc = user.get('lc_ig', 'Other')
+            reqs = config.LC_REQUISITES.get(user_lc, config.REQ_1)
+
+            msg = (
+                f"🔔 **НАПОМИНАНИЕ ОБ ОПЛАТЕ**\n\n"
+                f"До дедлайна осталось: **{days_left} дн.**\n"
+                f"Твой взнос: {config.REG_FEE}₽\n\n"
+                f"📍 Реквизиты ({user_lc}):\n{reqs}\n\n"
+                f"После оплаты обязательно пришли чек в этот чат! 👇"
+            )
+            try:
+                await bot.send_message(user_id, msg, parse_mode="Markdown")
+                await asyncio.sleep(0.05)  # Защита от спам-фильтра
+            except:
+                logging.warning(f"Could not send reminder to {user_id}")
 
 
-def get_yes_no_kb():
-    return ReplyKeyboardBuilder().button(text="Да").button(text="Нет").as_markup(resize_keyboard=True,
-                                                                                 one_time_keyboard=True)
-
-
-# --- РЕГИСТРАЦИЯ (ПОЛНЫЙ ЦИКЛ) ---
+# --- ХЕНДЛЕРЫ РЕГИСТРАЦИИ (Основные шаги) ---
 
 @router.message(CommandStart())
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer(config.WELCOME_MSG)
-    await m.answer("Введи свое ФИО (как в паспорте):")
+    await m.answer(f"Привет! Регистрация на {config.CONF_NAME} открыта 🚀\n\nНапиши свое ФИО:")
     await state.set_state(RegStates.fio)
 
 
 @router.message(RegStates.fio)
 async def p_fio(m: types.Message, state: FSMContext):
     await state.update_data(fio=m.text)
-    await m.answer("Твоя дата рождения (ДД.ММ.ГГГГ):")
+    await m.answer("Дата рождения (ДД.ММ.ГГГГ):")
     await state.set_state(RegStates.dob)
 
 
 @router.message(RegStates.dob)
 async def p_dob(m: types.Message, state: FSMContext):
     await state.update_data(dob=m.text)
-    await m.answer("Твой номер телефона:")
+    await m.answer("Номер телефона:")
     await state.set_state(RegStates.phone)
 
 
 @router.message(RegStates.phone)
 async def p_phone(m: types.Message, state: FSMContext):
-    await state.update_data(phone=m.text)
-    await m.answer("Нужна справка для ВУЗа?", reply_markup=get_yes_no_kb())
+    await state.update_data(phone=m.text, tg=f"@{m.from_user.username}")
+    lcs = list(config.LC_REQUISITES.keys()) + ["Other"]
+    await m.answer("Выбери свой LC / IG:", reply_markup=get_inline_kb(lcs, "lc_"))
+    await state.set_state(RegStates.lc_ig)
+
+
+@router.callback_query(F.data.startswith("lc_"))
+async def sel_lc(call: types.CallbackQuery, state: FSMContext):
+    lc = call.data.replace("lc_", "")
+    await state.update_data(lc_ig=lc)
+    await call.message.edit_text(f"Выбрано: {lc}\nТвоя позиция (Member/TL/EB):")
+    await state.set_state(RegStates.position)
+
+
+@router.message(RegStates.position)
+async def p_pos(m: types.Message, state: FSMContext):
+    await state.update_data(pos=m.text)
+    kb = ReplyKeyboardBuilder().button(text="Да").button(text="Нет").as_markup(resize_keyboard=True)
+    await m.answer("Нужна справка в ВУЗ?", reply_markup=kb)
     await state.set_state(RegStates.needs_release)
 
 
 @router.message(RegStates.needs_release)
-async def p_release(m: types.Message, state: FSMContext):
+async def p_rel(m: types.Message, state: FSMContext):
     if m.text.lower() == "да":
-        await m.answer("Напиши название ВУЗа:", reply_markup=types.ReplyKeyboardRemove())
+        await m.answer("Название ВУЗа:", reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(RegStates.uni_name)
     else:
-        await state.update_data(uni_name="Не требуется")
-        await m.answer("Твой уровень английского:", reply_markup=types.ReplyKeyboardRemove())
+        await state.update_data(uni="—")
+        opts = ["Basic", "Intermediate", "Fluent"]
+        await m.answer("Уровень английского:", reply_markup=get_inline_kb(opts), reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(RegStates.english)
 
 
 @router.message(RegStates.uni_name)
 async def p_uni(m: types.Message, state: FSMContext):
-    await state.update_data(uni_name=m.text)
-    await m.answer("Твой уровень английского:")
+    await state.update_data(uni=m.text)
+    await m.answer("Уровень английского:", reply_markup=get_inline_kb(["Basic", "Intermediate", "Fluent"]))
     await state.set_state(RegStates.english)
 
 
-@router.message(RegStates.english)
-async def p_eng(m: types.Message, state: FSMContext):
-    await state.update_data(english=m.text)
-    await m.answer("Есть ли у тебя аллергии?", reply_markup=get_yes_no_kb())
-    await state.set_state(RegStates.has_allergies)
+@router.callback_query(F.data.startswith("sel_"))
+async def handle_sel(call: types.CallbackQuery, state: FSMContext):
+    val = call.data.replace("sel_", "")
+    st = await state.get_state()
+
+    if st == RegStates.english.state:
+        await state.update_data(eng=val)
+        await call.message.edit_text(f"English: {val}\nЕсть ли аллергии?")
+        await state.set_state(RegStates.allergies)
+    elif st == RegStates.arrival_moscow.state:
+        await state.update_data(arr=val)
+        opts = ["Host", "Friend", "My place", "Other"]
+        await call.message.edit_text(f"Приезд: {val}")
+        await call.message.answer("Где будешь жить?", reply_markup=get_inline_kb(opts))
+        await state.set_state(RegStates.stay_place)
+    elif st == RegStates.stay_place.state:
+        await state.update_data(stay=val)
+        await call.message.edit_text(f"Жилье: {val}")
+        await call.message.answer("Ожидания от команды оргов?")
+        await state.set_state(RegStates.expectations_cc)
+    elif st == RegStates.agreements.state:
+        await state.update_data(agree="Yes")
+        await call.message.edit_text("✅ Принято. Когда оплатишь (ДД.ММ.ГГГГ)?")
+        await state.set_state(RegStates.plan_date)
+    await call.answer()
 
 
-@router.message(RegStates.has_allergies)
+@router.message(RegStates.allergies)
 async def p_alg(m: types.Message, state: FSMContext):
-    if m.text.lower() == "да":
-        await m.answer("Опиши их:", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(RegStates.allergies_info)
-    else:
-        await state.update_data(allergies="Нет")
-        await m.answer("Ты вегетарианец/веган?", reply_markup=get_yes_no_kb())
-        await state.set_state(RegStates.is_vegan)
-
-
-@router.message(RegStates.allergies_info)
-async def p_alg_info(m: types.Message, state: FSMContext):
-    await state.update_data(allergies=m.text)
-    await m.answer("Ты вегетарианец/веган?", reply_markup=get_yes_no_kb())
+    await state.update_data(alg=m.text)
+    kb = ReplyKeyboardBuilder().button(text="Да").button(text="Нет").as_markup(resize_keyboard=True)
+    await m.answer("Ты веган/вегетарианец?", reply_markup=kb)
     await state.set_state(RegStates.is_vegan)
 
 
 @router.message(RegStates.is_vegan)
 async def p_vegan(m: types.Message, state: FSMContext):
     if m.text.lower() == "да":
-        await m.answer("Напиши примеры блюд, которые ты ешь:", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(RegStates.vegan_info)
+        await m.answer("Что ты ешь?", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(RegStates.diet_info)
     else:
         await state.update_data(diet="Обычное")
-        await m.answer("Твои ожидания от конференции?", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(RegStates.expectations)
+        opts = ["On conf days", "1 day before", "Earlier"]
+        await m.answer("Когда приедешь?", reply_markup=get_inline_kb(opts), reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(RegStates.arrival_moscow)
 
 
-@router.message(RegStates.vegan_info)
-async def p_vegan_info(m: types.Message, state: FSMContext):
+@router.message(RegStates.diet_info)
+async def p_diet(m: types.Message, state: FSMContext):
     await state.update_data(diet=m.text)
-    await m.answer("Твои ожидания от конференции?")
-    await state.set_state(RegStates.expectations)
+    await m.answer("Когда приедешь?", reply_markup=get_inline_kb(["On conf days", "1 day before", "Earlier"]))
+    await state.set_state(RegStates.arrival_moscow)
 
 
-@router.message(RegStates.expectations)
-async def p_exp(m: types.Message, state: FSMContext):
-    await state.update_data(expectations=m.text)
-    await m.answer("📸 Пришли своё фото для пропуска (картинкой):")
-    await state.set_state(RegStates.waiting_photo)
+@router.message(RegStates.expectations_cc)
+async def p_cc(m: types.Message, state: FSMContext):
+    await state.update_data(cc=m.text)
+    await m.answer("Ожидания от контента?")
+    await state.set_state(RegStates.expectations_content)
 
 
-@router.message(RegStates.waiting_photo, F.photo)
-async def p_photo(m: types.Message, state: FSMContext):
-    data = await state.get_data()
-    safe_fio = re.sub(r'[^\w\s-]', '', data['fio']).strip().replace(' ', '_')
-    file_info = await bot.get_file(m.photo[-1].file_id)
-    dest = os.path.join(config.PHOTOS_DIR, f"{safe_fio}.jpg")
-    await bot.download_file(file_info.file_path, dest)
-    await state.update_data(photo_saved=dest)
+@router.message(RegStates.expectations_content)
+async def p_cont(m: types.Message, state: FSMContext):
+    await state.update_data(cont=m.text)
+    kb = ReplyKeyboardBuilder().button(text="Да").button(text="Нет").as_markup(resize_keyboard=True)
+    await m.answer("Хочешь быть волонтером?", reply_markup=kb)
+    await state.set_state(RegStates.is_volunteer)
 
-    ddl = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").strftime("%d.%m.%Y")
-    await m.answer(f"✅ Фото сохранено.\n\nКогда оплатишь? (Дедлайн: {ddl})\nНапиши дату как: 20.12.2025")
-    await state.set_state(RegStates.plan_date)
+
+@router.message(RegStates.is_volunteer)
+async def p_vol(m: types.Message, state: FSMContext):
+    await state.update_data(vol=m.text)
+    kb = InlineKeyboardBuilder().button(text="✅ Согласен со всем", callback_data="sel_Yes").as_markup()
+    await m.answer("Согласен на обработку данных и фотосъемку?", reply_markup=kb)
+    await state.set_state(RegStates.agreements)
 
 
 @router.message(RegStates.plan_date)
-async def p_date(m: types.Message, state: FSMContext):
-    try:
-        plan_dt = datetime.strptime(m.text, "%d.%m.%Y")
-        ddl_dt = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d")
-        if plan_dt > ddl_dt:
-            return await m.answer(f"❌ Позже дедлайна ({ddl_dt.strftime('%d.%m.%Y')}) нельзя! Введи другую дату:")
+async def p_fin(m: types.Message, state: FSMContext):
+    # 1. Сбор данных
+    data = await state.get_data()
+    data['plan_pay'] = m.text
 
-        await state.update_data(plan_pay_date=m.text)
-        data = await state.get_data()
-        save_user(data, m.from_user.id, m.from_user.username)
+    # 2. Сохранение в CSV
+    df = get_db()
+    new_data = {'id': m.from_user.id, **data, 'status': 'Pending'}
+    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+    df.to_csv(config.DB_FILE, index=False)
 
-        kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
-        await m.answer(f"Записал! Взнос: {config.REG_FEE}₽\n\n{config.REQUISITES}\n\nКидай чек сюда!", reply_markup=kb,
-                       parse_mode="Markdown")
-        await state.set_state(RegStates.waiting_payment)
-    except:
-        await m.answer("❌ Ошибка формата. Напиши дату как: 20.12.2025")
+    # 3. Выгрузка в Google Sheets
+    await save_to_gsheets(data)
+
+    # 4. УВЕДОМЛЕНИЕ О РЕГИСТРАЦИИ ДО ОПЛАТЫ
+    user_lc = data.get('lc_ig', 'Other')
+    reqs = config.LC_REQUISITES.get(user_lc, config.REQ_1)
+
+    confirm_msg = (
+        "✅ **РЕГИСТРАЦИЯ ПРИНЯТА!**\n\n"
+        "Мы сохранили твою анкету. Теперь осталось оплатить оргвзнос, чтобы закрепить место.\n\n"
+        f"💰 Сумма: **{config.REG_FEE}₽**\n"
+        f"📅 Твой план оплаты: {m.text}\n"
+        f"📍 Дедлайн: {config.PAYMENT_DDL}\n\n"
+        f"👇 **РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ ({user_lc}):**\n{reqs}\n\n"
+        "**После перевода пришли сюда скриншот чека!**"
+    )
+
+    kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
+    await m.answer(confirm_msg, reply_markup=kb, parse_mode="Markdown")
+    await state.set_state(RegStates.waiting_payment)
 
 
 @router.message(RegStates.waiting_payment, F.photo | F.document)
-async def p_receipt(m: types.Message):
+async def p_pay(m: types.Message):
+    # Уведомляем админов
     for aid in config.ADMIN_IDS:
-        await bot.send_message(aid,
-                               f"🧾 **НОВЫЙ ЧЕК**\nОт ID: `{m.from_user.id}`\nПодтвердить: `/confirm {m.from_user.id}`",
-                               parse_mode="Markdown")
-        await m.send_copy(chat_id=aid)
-    await m.answer("Чек принят! Проверим и подтвердим в ближайшее время.")
-
-
-# --- FAQ ---
-@router.message(Command("faq"))
-async def cmd_faq(m: types.Message):
-    kb = InlineKeyboardBuilder()
-    for q in config.FAQ_DATA.keys():
-        kb.button(text=q, callback_data=f"faq_{list(config.FAQ_DATA.keys()).index(q)}")
-    await m.answer("Выбери вопрос 👇", reply_markup=kb.adjust(1).as_markup())
-
-
-@router.callback_query(F.data.startswith("faq_"))
-async def faq_ans(call: types.CallbackQuery):
-    idx = int(call.data.split("_")[1])
-    q = list(config.FAQ_DATA.keys())[idx]
-    await call.message.answer(f"❓ **{q}**\n\n{config.FAQ_DATA[q]}", parse_mode="Markdown")
-    await call.answer()
-
-
-# --- АДМИНКА ---
-@router.message(Command("admin"))
-async def adm_panel(m: types.Message):
-    if m.from_user.id not in config.ADMIN_IDS: return
-
-    msg = (
-        "🛠 **АДМИН-ПАНЕЛЬ**\n\n"
-        "• `/post` — создать пост для рассылки\n"
-        "• `/confirm ID` — подтвердить оплату\n"
-        "• `/delete ID` — удалить запись\n"
-        "• `/stats` — мини-отчет"
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Статистика", callback_data="adm_stats")
-    kb.button(text="📥 База (CSV)", callback_data="adm_export")  # ВОТ ОНА!
-    kb.button(text="📸 Выгрузить все ФОТО", callback_data="adm_photos")
-    await m.answer(msg, reply_markup=kb.adjust(1).as_markup(), parse_mode="Markdown")
-
-
-@router.callback_query(F.data == "adm_stats")
-async def call_stats(c: types.CallbackQuery):
-    df = get_db()
-    total = len(df)
-    paid = len(df[df['status'] == 'Confirmed']) if not df.empty else 0
-    await c.message.answer(f"📊 **Статистика:**\nВсего заявок: {total}\nПодтверждено: {paid}")
-    await c.answer()
-
-
-@router.callback_query(F.data == "adm_export")  # ИСПРАВЛЕНО: Вернул обработчик
-async def call_export(c: types.CallbackQuery):
-    if os.path.exists(config.DB_FILE):
-        file = types.FSInputFile(config.DB_FILE)
-        await c.message.answer_document(file, caption="Актуальная база участников 📁")
-    else:
-        await c.answer("База пока пуста!", show_alert=True)
-    await c.answer()
-
-
-@router.callback_query(F.data == "adm_photos")
-async def call_photos(c: types.CallbackQuery):
-    files = [f for f in os.listdir(config.PHOTOS_DIR) if f.endswith('.jpg')]
-    if not files: return await c.answer("Фотографий нет.")
-
-    await c.message.answer(f"📤 Выгружаю {len(files)} фото...")
-    for f in files:
-        photo = types.FSInputFile(os.path.join(config.PHOTOS_DIR, f))
-        await bot.send_photo(c.from_user.id, photo, caption=f"👤 {f}")
-        await asyncio.sleep(0.05)
-    await c.answer()
-
-
-# --- РАССЫЛКА ПОСТОВ ---
-@router.message(Command("post"))
-async def adm_post_start(m: types.Message, state: FSMContext):
-    if m.from_user.id not in config.ADMIN_IDS: return
-    await m.answer("Пришли пост (текст, фото, видео), который надо разослать. Я покажу превью.")
-    await state.set_state(RegStates.waiting_post)
-
-
-@router.message(RegStates.waiting_post)
-async def adm_post_preview(m: types.Message, state: FSMContext):
-    await state.update_data(p_id=m.message_id, p_chat=m.chat.id)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🚀 РАЗОСЛАТЬ", callback_data="b_go")
-    kb.button(text="❌ ОТМЕНА", callback_data="b_cancel")
-    await m.answer("ТАК БУДЕТ ВЫГЛЯДЕТЬ ПОСТ:")
-    await m.copy_to(chat_id=m.chat.id)
-    await m.answer("Запускаем рассылку?", reply_markup=kb.adjust(1).as_markup())
-
-
-@router.callback_query(F.data == "b_go")
-async def broadcast_go(c: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    df = get_db()
-    if df.empty: return await c.answer("Некому слать.")
-
-    uids = df['tg_id'].unique()
-    await c.message.edit_text(f"🚀 Рассылаю на {len(uids)} чел...")
-    for uid in uids:
         try:
-            await bot.copy_message(uid, data['p_chat'], data['p_id'])
-            await asyncio.sleep(0.05)
+            await bot.send_message(aid,
+                                   f"🧾 **НОВЫЙ ЧЕК**\nОт: `{m.from_user.id}`\nПодтвердить: `/confirm {m.from_user.id}`")
+            await m.send_copy(chat_id=aid)
         except:
             pass
-    await c.message.answer("✅ Рассылка завершена!")
-    await state.clear()
+    await m.answer("Чек принят! Мы проверим его и пришлем подтверждение в течение 24 часов. ✨")
 
 
-@router.callback_query(F.data == "b_cancel")
-async def broadcast_cancel(c: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.message.edit_text("❌ Рассылка отменена.")
-
-
-# --- УТИЛИТЫ ---
+# --- АДМИН-КОМАНДЫ ---
 @router.message(Command("confirm"))
 async def adm_confirm(m: types.Message):
     if m.from_user.id not in config.ADMIN_IDS: return
     try:
         uid = int(m.text.split()[1])
         df = get_db()
-        df.loc[df['tg_id'] == uid, 'status'] = 'Confirmed'
-        df.to_csv(config.DB_FILE, index=False)
-        await bot.send_message(uid, "✨ **Твоя оплата подтверждена!** Ждем тебя на конференции!")
-        await m.answer(f"✅ Участник {uid} подтвержден.")
+        if not df.empty:
+            df.loc[df['id'] == uid, 'status'] = 'Confirmed'
+            df.to_csv(config.DB_FILE, index=False)
+            await bot.send_message(uid,
+                                   "🎉 **Оплата подтверждена!**\nТы официально участник Nat'co 26. Увидимся на конференции!")
+            await m.answer(f"Участник {uid} подтвержден.")
     except:
-        await m.answer("Пример: `/confirm 123456`", parse_mode="Markdown")
-
-
-@router.message(Command("delete"))
-async def adm_delete(m: types.Message):
+        await m.answer("Используй: `/confirm ID`")
+# --- Админка ---
+@router.message(Command("admin"))
+async def adm(m: types.Message):
     if m.from_user.id not in config.ADMIN_IDS: return
-    try:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Стата", callback_data="a_st").button(text="📥 База", callback_data="a_ex")
+    await m.answer("🛠 Админка:", reply_markup=kb.adjust(1).as_markup())
+
+
+@router.callback_query(F.data == "a_st")
+async def a_st(c: types.CallbackQuery):
+    await c.message.answer(f"Всего: {len(get_db())}")
+    await c.answer()
+
+
+@router.callback_query(F.data == "a_ex")
+async def a_ex(c: types.CallbackQuery):
+    if os.path.exists(config.DB_FILE): await c.message.answer_document(types.FSInputFile(config.DB_FILE))
+    await c.answer()
+
+
+@router.message(Command("confirm"))
+async def adm_conf(m: types.Message):
+    if m.from_user.id in config.ADMIN_IDS:
         uid = int(m.text.split()[1])
-        df = get_db()
-        df = df[df['tg_id'] != uid]
-        df.to_csv(config.DB_FILE, index=False)
-        await m.answer(f"💀 Запись {uid} удалена.")
-    except:
-        await m.answer("Пример: `/delete 123456`", parse_mode="Markdown")
+        await bot.send_message(uid, "✨ Оплата подтверждена! До встречи!")
+        await m.answer("Готово.")
 
 
-async def main():
+@router.message(Command("post"))
+async def adm_post(m: types.Message, state: FSMContext):
+    if m.from_user.id in config.ADMIN_IDS:
+        await m.answer("Пришли пост:")
+        await state.set_state(RegStates.waiting_post)
+
+
+@router.message(RegStates.waiting_post)
+async def post_go(m: types.Message, state: FSMContext):
+    uids = get_db()['id'].unique()
+    for u in uids:
+        try:
+            await m.copy_to(u)
+        except:
+            pass
+    await m.answer(f"Разослано на {len(uids)} чел.")
+    await state.clear()
+
+
+async def start():
     dp.include_router(router)
     await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == "__main__": asyncio.run(start())

@@ -1,3 +1,5 @@
 aiogram
 pandas
 apscheduler
+gspread
+oauth2client
