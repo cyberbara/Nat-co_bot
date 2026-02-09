@@ -2,11 +2,10 @@ version: '3.8'
 services:
   bot:
     build: .
-    container_name: natco_bot
+    container_name: RusCo
     restart: always
     volumes:
       - .:/app
-      - ./registration_photos:/app/registration_photos
       - ./participants.csv:/app/participants.csv
     environment:
       - PYTHONUNBUFFERED=1

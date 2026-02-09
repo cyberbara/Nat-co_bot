@@ -1,6 +1,6 @@
 import os
 
-TOKEN = "твой_токен_бота"
+TOKEN = "8276545596:AAEfbFRteSFa2JRIy7fZMmgIJhc1CKZf3oY"
 ADMIN_IDS = [1661192784]
 
 CONF_NAME = "Nat'co 26"
@@ -23,9 +23,3 @@ GS_KEY_FILE = "google_key.json"
 GS_SHEET_URL = "https://docs.google.com/spreadsheets/d/ТВОЙ_ID"
 DB_FILE = "participants.csv"
 
-# Google Sheets
-USE_GOOGLE_SHEETS = True
-GS_KEY_FILE = "google_key.json"
-GS_SHEET_URL = "https://docs.google.com/spreadsheets/d/ТВОЙ_ID_ТАБЛИЦЫ"
-
-DB_FILE = "participants.csv"
