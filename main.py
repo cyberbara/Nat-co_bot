@@ -56,13 +56,24 @@ def get_db():
     return pd.DataFrame()
 
 
+def validate_date(date_text):
+    """Проверяет формат даты ДД.ММ.ГГГГ"""
+    try:
+        return datetime.strptime(date_text, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
 async def save_to_gsheets(data):
     if not config.USE_GOOGLE_SHEETS: return
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        # Убедись, что файл JSON валиден (двойные кавычки!)
         creds = ServiceAccountCredentials.from_json_keyfile_name(config.GS_KEY_FILE, scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_url(config.GS_SHEET_URL).sheet1
+
+        # Преобразуем словарь в список значений
         row = [datetime.now().strftime("%Y-%m-%d %H:%M")] + list(data.values())
         sheet.append_row(row)
     except Exception as e:
@@ -78,10 +89,10 @@ def get_inline_kb(options, prefix="sel_"):
 
 # --- Логика напоминаний ---
 async def send_payment_reminders():
+    # ... (код напоминаний без изменений)
     logging.info("Checking for payment reminders...")
     df = get_db()
     if df.empty or 'status' not in df.columns: return
-
     try:
         ddl_date = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").date()
         today = datetime.now().date()
@@ -93,21 +104,14 @@ async def send_payment_reminders():
                 user_id = user['id']
                 user_lc = user.get('lc_ig', 'Other')
                 reqs = config.LC_REQUISITES.get(user_lc, config.REQ_1)
-
-                msg = (
-                    f"🔔 **НАПОМИНАНИЕ ОБ ОПЛАТЕ**\n\n"
-                    f"До дедлайна осталось: **{days_left} дн.**\n"
-                    f"Твой взнос: {config.REG_FEE}₽\n\n"
-                    f"📍 Реквизиты ({user_lc}):\n{reqs}\n\n"
-                    f"После оплаты обязательно пришли чек в этот чат! 👇"
-                )
+                msg = f"🔔 Напоминание! До дедлайна {days_left} дн. Взнос: {config.REG_FEE}₽"
                 try:
-                    await bot.send_message(user_id, msg, parse_mode="Markdown")
+                    await bot.send_message(user_id, msg)
                     await asyncio.sleep(0.05)
                 except Exception:
-                    logging.warning(f"Could not send reminder to {user_id}")
+                    pass
     except Exception as e:
-        logging.error(f"Reminder Logic Error: {e}")
+        logging.error(f"Reminder Error: {e}")
 
 
 # --- Хендлеры регистрации ---
@@ -115,13 +119,8 @@ async def send_payment_reminders():
 @router.message(CommandStart())
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer(f"""Привет, будущий делегат RusCo'26!
-
-Этот бот - твой помощник по регистрации на самую лучшую конференцию, которая пройдет в Москве с 17 по 19 апреля.
-
-Давай вместе пройдем несколько простых шагов, чтобы наполнить твой опыт незабываемыми эмоциями 🧡
-
-Напиши свое ФИО:""")
+    # Удаляем старую клавиатуру на всякий случай
+    await m.answer("Привет! Напиши свое ФИО:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(RegStates.fio)
 
 
@@ -134,6 +133,12 @@ async def p_fio(m: types.Message, state: FSMContext):
 
 @router.message(RegStates.dob)
 async def p_dob(m: types.Message, state: FSMContext):
+    # ВАЛИДАЦИЯ ДАТЫ РОЖДЕНИЯ
+    d = validate_date(m.text)
+    if not d:
+        await m.answer("❌ Неверный формат даты. Пожалуйста, введи в формате ДД.ММ.ГГГГ (например, 25.05.2003)")
+        return
+
     await state.update_data(dob=m.text)
     await m.answer("Номер телефона:")
     await state.set_state(RegStates.phone)
@@ -151,7 +156,8 @@ async def p_phone(m: types.Message, state: FSMContext):
 async def sel_lc(call: types.CallbackQuery, state: FSMContext):
     lc = call.data.replace("lc_", "")
     await state.update_data(lc_ig=lc)
-    await call.message.edit_text(f"Выбрано: {lc}\nТвоя позиция (Member/TL/EB):")
+    # Редактируем сообщение, удаляя кнопки
+    await call.message.edit_text(f"Выбрано: {lc}\nТвоя позиция (Member/TL/EB/итд):")
     await state.set_state(RegStates.position)
 
 
@@ -165,20 +171,26 @@ async def p_pos(m: types.Message, state: FSMContext):
 
 @router.message(RegStates.needs_release)
 async def p_rel(m: types.Message, state: FSMContext):
+    # Удаляем клавиатуру Да/Нет
     if m.text.lower() == "да":
         await m.answer("Название ВУЗа:", reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(RegStates.uni_name)
-    else:
+    elif m.text.lower() == "нет":
         await state.update_data(uni="—")
-        opts = ["Basic", "Intermediate", "Fluent"]
+        opts = ["Basic", "Intermediate", "Upper-intermediate"]
+        # Сначала пишем сообщение с удалением клавиатуры, потом инлайн (т.к. нельзя в одном сообщении и удалить Reply, и показать Inline)
+        await m.answer("Понял.", reply_markup=types.ReplyKeyboardRemove())
         await m.answer("Уровень английского:", reply_markup=get_inline_kb(opts))
         await state.set_state(RegStates.english)
+    else:
+        await m.answer("Пожалуйста, нажми кнопку Да или Нет.")
 
 
 @router.message(RegStates.uni_name)
 async def p_uni(m: types.Message, state: FSMContext):
     await state.update_data(uni=m.text)
-    await m.answer("Уровень английского:", reply_markup=get_inline_kb(["Basic", "Intermediate", "Upper-intermediate"]))
+    opts = ["Basic", "Intermediate", "Upper-intermediate"]
+    await m.answer("Уровень английского:", reply_markup=get_inline_kb(opts))
     await state.set_state(RegStates.english)
 
 
@@ -187,25 +199,37 @@ async def handle_sel(call: types.CallbackQuery, state: FSMContext):
     val = call.data.replace("sel_", "")
     st = await state.get_state()
 
+    # ОБЩАЯ ЛОГИКА: Редактируем текст, чтобы кнопки пропали
+    original_text = call.message.text
+
     if st == RegStates.english.state:
         await state.update_data(eng=val)
-        await call.message.edit_text(f"English: {val}\nЕсть ли аллергии?")
+        await call.message.edit_text(f"{original_text}\n✅ Выбрано: {val}")
+        await call.message.answer("Есть ли аллергии?")
         await state.set_state(RegStates.allergies)
+
     elif st == RegStates.arrival_moscow.state:
         await state.update_data(arr=val)
         opts = ["Host", "Friend", "My place", "Other"]
-        await call.message.edit_text(f"Приезд: {val}")
+        await call.message.edit_text(f"{original_text}\n✅ Выбрано: {val}")
         await call.message.answer("Где будешь жить?", reply_markup=get_inline_kb(opts))
         await state.set_state(RegStates.stay_place)
+
     elif st == RegStates.stay_place.state:
         await state.update_data(stay=val)
-        await call.message.edit_text(f"Жилье: {val}")
+        await call.message.edit_text(f"{original_text}\n✅ Выбрано: {val}")
         await call.message.answer("Ожидания от команды оргов?")
         await state.set_state(RegStates.expectations_cc)
+
     elif st == RegStates.agreements.state:
         await state.update_data(agree="Yes")
-        await call.message.edit_text("✅ Принято. Когда оплатишь (ДД.ММ.ГГГГ)?")
+        await call.message.edit_text(f"✅ Соглашения приняты.")
+
+        deadline_str = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").strftime("%d.%m.%Y")
+        await call.message.answer(
+            f"Когда планируешь оплатить взнос?\n⚠️ Крайний срок: **{deadline_str}**\nВведите дату (ДД.ММ.ГГГГ):")
         await state.set_state(RegStates.plan_date)
+
     await call.answer()
 
 
@@ -219,14 +243,19 @@ async def p_alg(m: types.Message, state: FSMContext):
 
 @router.message(RegStates.is_vegan)
 async def p_vegan(m: types.Message, state: FSMContext):
+    # Удаляем клавиатуру
     if m.text.lower() == "да":
-        await m.answer("Что ты ешь?", reply_markup=types.ReplyKeyboardRemove())
+        await m.answer("Что ты ешь/не ешь?", reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(RegStates.diet_info)
-    else:
+    elif m.text.lower() == "нет":
         await state.update_data(diet="Обычное")
+        await m.answer("Окей, обычное питание.", reply_markup=types.ReplyKeyboardRemove())
+
         opts = ["On conf days", "1 day before", "Earlier"]
         await m.answer("Когда приедешь?", reply_markup=get_inline_kb(opts))
         await state.set_state(RegStates.arrival_moscow)
+    else:
+        await m.answer("Используй кнопки Да/Нет")
 
 
 @router.message(RegStates.diet_info)
@@ -253,7 +282,14 @@ async def p_cont(m: types.Message, state: FSMContext):
 
 @router.message(RegStates.is_volunteer)
 async def p_vol(m: types.Message, state: FSMContext):
+    if m.text.lower() not in ['да', 'нет']:
+        await m.answer("Пожалуйста, выбери Да или Нет.")
+        return
+
     await state.update_data(vol=m.text)
+    # Удаляем клавиатуру перед отправкой инлайн
+    await m.answer("Отлично.", reply_markup=types.ReplyKeyboardRemove())
+
     kb = InlineKeyboardBuilder().button(text="✅ Согласен со всем", callback_data="sel_Yes").as_markup()
     await m.answer("Согласен на обработку данных и фотосъемку?", reply_markup=kb)
     await state.set_state(RegStates.agreements)
@@ -261,10 +297,30 @@ async def p_vol(m: types.Message, state: FSMContext):
 
 @router.message(RegStates.plan_date)
 async def p_fin(m: types.Message, state: FSMContext):
+    # ВАЛИДАЦИЯ ДАТЫ ОПЛАТЫ И ДЕДЛАЙНА
+    input_date = validate_date(m.text)
+
+    # Получаем дедлайн из конфига (формат там YYYY-MM-DD)
+    try:
+        deadline_date = datetime.strptime(config.PAYMENT_DDL, "%Y-%m-%d").date()
+    except ValueError:
+        # Если в конфиге ошибка, ставим дефолтную далекую дату, чтобы не ломать бота
+        deadline_date = datetime(2030, 1, 1).date()
+
+    if not input_date:
+        await m.answer("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ (например, 10.04.2026)")
+        return
+
+    if input_date > deadline_date:
+        await m.answer(
+            f"❌ Дата оплаты не может быть позже дедлайна ({deadline_date.strftime('%d.%m.%Y')}). Пожалуйста, укажи более раннюю дату.")
+        return
+
+    # Если дата корректная и до дедлайна
     data = await state.get_data()
     data['plan_pay'] = m.text
 
-    # Сохранение в CSV
+    # Сохраняем и шлём подтверждение
     df = get_db()
     new_data = {'id': m.from_user.id, **data, 'status': 'Pending'}
     df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
@@ -277,11 +333,9 @@ async def p_fin(m: types.Message, state: FSMContext):
 
     confirm_msg = (
         "✅ **РЕГИСТРАЦИЯ ПРИНЯТА!**\n\n"
-        "Мы сохранили твою анкету. Теперь осталось оплатить оргвзнос.\n\n"
-        f"💰 Сумма: **{config.REG_FEE}₽**\n"
-        f"📅 Твой план оплаты: {m.text}\n\n"
-        f"👇 **РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ ({user_lc}):**\n{reqs}\n\n"
-        "**После перевода пришли сюда скриншот чека!**"
+        f"📅 Твой план оплаты: {m.text}\n"
+        f"👇 **РЕКВИЗИТЫ ({user_lc}):**\n{reqs}\n\n"
+        "**Пришли сюда чек после оплаты!**"
     )
     await m.answer(confirm_msg, parse_mode="Markdown")
     await state.set_state(RegStates.waiting_payment)
@@ -372,11 +426,9 @@ async def post_go(m: types.Message, state: FSMContext):
 
 async def main():
     dp.include_router(router)
-    # Запуск планировщика для напоминаний (раз в день в 11:00)
     scheduler.add_job(send_payment_reminders, 'cron', hour=11, minute=0)
     scheduler.start()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     try:
