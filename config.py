@@ -1,10 +1,10 @@
 import os
 
 TOKEN = "8276545596:AAEfbFRteSFa2JRIy7fZMmgIJhc1CKZf3oY"
-ADMIN_IDS = [1661192784]
+ADMIN_IDS = [1661192784, 1029208933, 510501198, 1330932352, 920171351]
 
-CONF_NAME = "Nat'co 26"
-PAYMENT_DDL = "2025-12-21"  # Дедлайн оплаты (ГГГГ-ММ-ДД)
+CONF_NAME = "Rus'co 26"
+PAYMENT_DDL = "2026-02-23"  # Дедлайн оплаты (ГГГГ-ММ-ДД)
 REG_FEE = 1500
 
 # Реквизиты (те же группы)
@@ -20,6 +20,6 @@ LC_REQUISITES = {
 
 USE_GOOGLE_SHEETS = True
 GS_KEY_FILE = "google_key.json"
-GS_SHEET_URL = "https://docs.google.com/spreadsheets/d/ТВОЙ_ID"
+GS_SHEET_URL = "https://docs.google.com/spreadsheets/d/1Wl4Lv76YglBwf7WCb4PW5K_fNzYErPYn-7WOmZ1XBBQ"
 DB_FILE = "participants.csv"
 

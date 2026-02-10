@@ -115,7 +115,13 @@ async def send_payment_reminders():
 @router.message(CommandStart())
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer(f"Привет! Регистрация на {config.CONF_NAME} открыта 🚀\n\nНапиши свое ФИО:")
+    await m.answer(f"""Привет, будущий делегат RusCo'26!
+
+Этот бот - твой помощник по регистрации на самую лучшую конференцию, которая пройдет в Москве с 17 по 19 апреля.
+
+Давай вместе пройдем несколько простых шагов, чтобы наполнить твой опыт незабываемыми эмоциями 🧡
+
+Напиши свое ФИО:""")
     await state.set_state(RegStates.fio)
 
 
@@ -172,7 +178,7 @@ async def p_rel(m: types.Message, state: FSMContext):
 @router.message(RegStates.uni_name)
 async def p_uni(m: types.Message, state: FSMContext):
     await state.update_data(uni=m.text)
-    await m.answer("Уровень английского:", reply_markup=get_inline_kb(["Basic", "Intermediate", "Fluent"]))
+    await m.answer("Уровень английского:", reply_markup=get_inline_kb(["Basic", "Intermediate", "Upper-intermediate"]))
     await state.set_state(RegStates.english)
 
 
@@ -277,8 +283,7 @@ async def p_fin(m: types.Message, state: FSMContext):
         f"👇 **РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ ({user_lc}):**\n{reqs}\n\n"
         "**После перевода пришли сюда скриншот чека!**"
     )
-    kb = ReplyKeyboardBuilder().button(text="✅ Я оплатил(а)").as_markup(resize_keyboard=True)
-    await m.answer(confirm_msg, reply_markup=kb, parse_mode="Markdown")
+    await m.answer(confirm_msg, parse_mode="Markdown")
     await state.set_state(RegStates.waiting_payment)
 
 
